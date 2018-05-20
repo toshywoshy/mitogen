@@ -14,439 +14,339 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
-# Make coding more python3-ish
-from __future__ import (absolute_import, division, print_function)
-__metaclass__ = type
 
-DOCUMENTATION = '''
-    strategy: linear
-    short_description: Executes tasks in a linear fashion
-    description:
-        - Task execution is in lockstep per host batch as defined by C(serial) (default all).
-          Up to the fork limit of hosts will execute each task at the same time and then
-          the next series of hosts until the batch is done, before going on to the next task.
-    version_added: "2.0"
-    notes:
-     - This was the default Ansible behaviour before 'strategy plugins' were introduced in 2.0.
-    author: Ansible Core Team
-'''
+from __future__ import absolute_import
+import logging
 
-from ansible.errors import AnsibleError, AnsibleAssertionError
+import ansible.errors
+import ansible.plugins.loader
+import ansible.plugins.strategy
+import ansible.template
+import ansible_mitogen.controller.includes
+
 from ansible.executor.play_iterator import PlayIterator
-from ansible.module_utils.six import iteritems
 from ansible.module_utils._text import to_text
-from ansible.playbook.block import Block
-from ansible.playbook.included_file import IncludedFile
-from ansible.playbook.task import Task
-from ansible.plugins.loader import action_loader
-from ansible.plugins.strategy import StrategyBase
-from ansible.template import Templar
 
 
-try:
-    from __main__ import display
-except ImportError:
-    from ansible.utils.display import Display
-    display = Display()
+LOG = logging.getLogger(__name__)
 
 
-class StrategyModule(StrategyBase):
+def _action_bypasses_host_loop(action_name):
+    """
+    Return :data:`True` if the action plug-in corresponding to
+    `action_name` should execute only for the first host.
+    """
+    try:
+        action = ansible.plugins.loader.action_loader.get(
+            action_name,
+            class_only=True,
+        )
+        return getattr(action, 'BYPASS_HOST_LOOP', False)
+    except KeyError:
+        # Action plugin missing (e.g. normal module execution).
+        return False
 
-    noop_task = None
 
-    def _replace_with_noop(self, target):
-        if self.noop_task is None:
-            raise AnsibleAssertionError('strategy.linear.StrategyModule.noop_task is None, need Task()')
+def _is_duplicate_task(host, task):
+    """
+    Avoid repeat execution of a role unless it is requested.
+    """
+    return (
+        task._role and
+        task._role.has_run(host) and
+        not getattr(task._role._metadata, 'allow_duplicates', False)
+    )
 
-        result = []
-        for el in target:
-            if isinstance(el, Task):
-                result.append(self.noop_task)
-            elif isinstance(el, Block):
-                result.append(self._create_noop_block_from(el, el._parent))
-        return result
 
-    def _create_noop_block_from(self, original_block, parent):
-        noop_block = Block(parent_block=parent)
-        noop_block.block = self._replace_with_noop(original_block.block)
-        noop_block.always = self._replace_with_noop(original_block.always)
-        noop_block.rescue = self._replace_with_noop(original_block.rescue)
+def _clone(obj, **kwargs):
+    """
+    Return a copy of `obj` without calling its constructor, after updating its
+    attributes with `kwargs`.
+    """
+    new = type(obj).__new__(type(obj))
+    vars(new).update(vars(obj))
+    vars(new).update(kwargs)
+    return new
 
-        return noop_block
 
-    def _prepare_and_create_noop_block_from(self, original_block, parent, iterator):
-        self.noop_task = Task()
-        self.noop_task.action = 'meta'
-        self.noop_task.args['_raw_params'] = 'noop'
-        self.noop_task.set_loader(iterator._play._loader)
+class StrategyModule(ansible.plugins.strategy.StrategyBase):
+    """
+    The linear strategy is simple - get the next task and queue it for all
+    hosts, then wait for the queue to drain before moving on to the next task
+    """
+    NAME_BY_ITER_STATE = {
+        PlayIterator.ITERATING_SETUP: 'ITERATING_SETUP',
+        PlayIterator.ITERATING_TASKS: 'ITERATING_TASKS',
+        PlayIterator.ITERATING_RESCUE: 'ITERATING_RESCUE',
+        PlayIterator.ITERATING_ALWAYS: 'ITERATING_ALWAYS',
+        PlayIterator.ITERATING_COMPLETE: 'ITERATING_COMPLETE'
+    }
 
-        return self._create_noop_block_from(original_block, parent)
+    #: Play progresses through each state in order, with no host proceeding to
+    #: the next state until all hosts are ready.
+    ITERATOR_PHASES = (
+        PlayIterator.ITERATING_SETUP,
+        PlayIterator.ITERATING_TASKS,
+        PlayIterator.ITERATING_RESCUE,
+        PlayIterator.ITERATING_ALWAYS,
+    )
 
-    def _get_next_task_lockstep(self, hosts, iterator):
-        '''
-        Returns a list of (host, task) tuples, where the task may
-        be a noop task to keep the iterator in lock step across
-        all hosts.
-        '''
+    DONT_FAIL_STATES = frozenset([
+        PlayIterator.ITERATING_RESCUE,
+        PlayIterator.ITERATING_ALWAYS
+    ])
 
-        noop_task = Task()
-        noop_task.action = 'meta'
-        noop_task.args['_raw_params'] = 'noop'
-        noop_task.set_loader(iterator._play._loader)
+    def construct(self, iterator, play_context):
+        """
+        Finalize construction using parameters passed via :meth:`run`.
+        """
+        self._iterator = iterator
+        self._play_context = play_context
+        self._templar = ansible.template.Templar(loader=self._tqm.get_loader())
+        self._run_result = self._tqm.RUN_OK
+        self._includes = ansible_mitogen.controller.includes.Parser(
+            tqm=self._tqm,
+            play_context=self._play_context,
+            var_manager=self._variable_manager,
+            iterator=self._iterator,
+        )
 
-        host_tasks = {}
-        display.debug("building list of next tasks for hosts")
-        for host in hosts:
-            host_tasks[host.name] = iterator.get_next_task_for_host(host, peek=True)
-        display.debug("done building task lists")
+    def _peek_task(self, host):
+        """
+        Sanitized interface to PlayIterator.get_next_task_for_host().
+        """
+        return self._iterator.get_next_task_for_host(host, peek=True)
 
-        num_setups = 0
-        num_tasks = 0
-        num_rescue = 0
-        num_always = 0
+    def get_hosts_left(self):
+        """
+        Sanitized interface to StrategyBase.get_hosts_left().
+        """
+        return super(StrategyModule, self).get_hosts_left(self._iterator)
 
-        display.debug("counting tasks in each state of execution")
-        host_tasks_to_run = [(host, state_task)
-                             for host, state_task in iteritems(host_tasks)
-                             if state_task and state_task[1]]
+    def _execute_meta(self, task, host):
+        """
+        Sanitized interface to StrategyBase._execute_meta().
+        """
+        return super(StrategyModule, self)._execute_meta(
+            task,
+            self._play_context,
+            self._iterator,
+            host,
+        )
 
-        if host_tasks_to_run:
-            try:
-                lowest_cur_block = min(
-                    (s.cur_block for h, (s, t) in host_tasks_to_run
-                     if s.run_state != PlayIterator.ITERATING_COMPLETE))
-            except ValueError:
-                lowest_cur_block = None
-        else:
-            # empty host_tasks_to_run will just run till the end of the function
-            # without ever touching lowest_cur_block
-            lowest_cur_block = None
+    def _process_pending_results(self, max_passes=None):
+        """
+        Sanitized interface to StrategyBase._process_pending_results().
+        """
+        return super(StrategyModule, self)._process_pending_results(
+            self._iterator,
+            max_passes=max_passes,
+        )
 
-        for (k, v) in host_tasks_to_run:
-            (s, t) = v
+    def _advance_selected_hosts(self, cur_block, state):
+        """
+        Return the task for all hosts in the requested state, otherwise they
+        get a noop dummy task. This also advances the state of the host, since
+        the given states are determined while using peek=True.
+        """
+        LOG.debug("advancing hosts in %r", self.NAME_BY_ITER_STATE[state])
 
-            if s.cur_block > lowest_cur_block:
-                # Not the current block, ignore it
+        tasks = []
+        hosts = []
+        for host in self.get_hosts_left():
+            hstate, task = self._peek_task(host)
+            if task is None:
+                continue
+            if hstate.run_state == state and hstate.cur_block == cur_block:
+                self._iterator.get_next_task_for_host(host)  # advance.
+                hosts.append(host)
+                tasks.append(task)
+            else:
+                LOG.error('NOOP!')
+
+        assert all(tasks[0] == t for t in tasks)
+        return tasks[0], hosts
+
+    def _get_next_task_lockstep(self):
+        """
+        Return a tuple of the next :class:`ansible.playbook.task.Task` to
+        execute and a list of :class:`ansible.playbook.inventory.Host` to
+        execute it on.
+        """
+        host_state_task = [
+            (host, (hstate, task))
+            for host, (hstate, task) in (
+                (host, self._peek_task(host))
+                for host in self.get_hosts_left()
+            )
+            if task
+        ]
+
+        if host_state_task:
+            cur_block = min(
+                hstate.cur_block
+                for host, (hstate, task) in host_state_task
+                if hstate.run_state != PlayIterator.ITERATING_COMPLETE
+            )
+            for state in self.ITERATOR_PHASES:
+                if any(hstate.cur_block <= cur_block and
+                       hstate.run_state == state
+                       for host, (hstate, task) in host_state_task):
+                    return self._advance_selected_hosts(cur_block, state)
+
+        LOG.debug("all hosts are done, returning None for all hosts")
+        return None, []
+
+    def _is_any_errors_fatal_task(self, task):
+        """
+        Return :data:`True` if `task` was marked with ``any_errors_fatal:
+        true``, and neither it nor its parent context had ``ignore_errors:
+        false``.
+        """
+        return (not task.ignore_errors) and (
+            task.any_errors_fatal or
+            self._is_run_once_task(task)
+        )
+
+    def _check_any_errors_fatal(self, task, failed, unreachable):
+        """
+        If any_errors_fatal is :data:`True` and an error occurred, mark all
+        hosts failed.
+        """
+        LOG.debug("_check_any_errors_fatal()")
+        if (failed or unreachable) and self._is_any_errors_fatal_task(task):
+            for host in self.get_hosts_left():
+                hstate, task = self._peek_task(host)
+                if hstate.run_state not in self.DONT_FAIL_STATES or \
+                   hstate.run_state == self._iterator.ITERATING_RESCUE and \
+                   hstate.fail_state & self._iterator.FAILED_RESCUE != 0:
+                    self._tqm._failed_hosts[host.name] = True
+        LOG.debug("done checking for any_errors_fatal")
+
+    def _check_max_fail_percentage(self, results, failed, unreachable):
+        LOG.debug("_check_max_fail_percentage()")
+        if results and self._iterator._play.max_fail_percentage is not None:
+            percentage = self._iterator._play.max_fail_percentage / 100.0
+            failed_count = len(self._tqm._failed_hosts)
+            if (failed_count / self._iterator.batch_size) > percentage:
+                for host in self.get_hosts_left():
+                    # don't double-mark hosts, or the iterator will potentially
+                    # fail them out of the rescue/always states
+                    if host.name not in failed:
+                        self._tqm._failed_hosts[host.name] = True
+                        self._iterator.mark_host_failed(host)
+                self._tqm.send_callback('v2_playbook_on_no_hosts_remaining')
+                self._run_result |= self._tqm.RUN_FAILED_BREAK_PLAY
+            LOG.debug('(%s failed / %s total )> %s max fail' % (
+                len(self._tqm._failed_hosts),
+                self._iterator.batch_size,
+                percentage
+            ))
+
+    def _check_failures(self, task, results):
+        failed = []
+        unreachable = []
+        for res in results:
+            if res.is_failed() and self._iterator.is_failed(res._host):
+                failed.append(res._host.name)
+            elif res.is_unreachable():
+                unreachable.append(res._host.name)
+
+        self._check_any_errors_fatal(task, failed, unreachable)
+        self._check_max_fail_percentage(results, failed, unreachable)
+
+    def _drain_results(self, task, results):
+        LOG.debug("done queuing tasks, waiting for results to drain")
+        results.extend(self._wait_on_pending_results(self._iterator))
+        self.update_active_connections(results)
+        self._check_failures(task, results)
+
+    def _is_run_once_task(self, task):
+        """
+        Return :data:`True` if `task` is a meta task, uses an action plug-in
+        that sets :attr:`BYPASS_HOST_LOOP`, or specifies ``run_once``.
+        """
+        return (task.action == 'meta' or
+                _action_bypasses_host_loop(task.action) or
+                self._templar.template(task.run_once))
+
+    def _send_task_start_callback(self, task, task_vars):
+        """
+        For the first host of the first CPU, ..
+        """
+        self._templar.set_available_variables(task_vars)
+        name = self._templar.template(task.name, fail_on_undefined=False)
+        new_task = _clone(task, name=to_text(name, nonstring='empty'))
+        self._tqm.send_callback('v2_playbook_on_task_start',
+                                new_task, is_conditional=False)
+
+    def _start_regular_task(self, host, task, cpu, host_index):
+        task_vars = self._variable_manager.get_vars(
+            play=self._iterator._play,
+            host=host,
+            task=task,
+        )
+        self.add_tqm_variables(task_vars, play=self._iterator._play)
+        self._templar.set_available_variables(task_vars)
+        if cpu == 0 and host_index == 0:
+            self._send_task_start_callback(task, task_vars)
+        self._queue_task(host, task, task_vars, self._play_context)
+
+    def _run_next_task(self):
+        task, hosts = self._get_next_task_lockstep()
+        if task is None:
+            return False
+
+        results = []
+        for host_index, host in enumerate(hosts):
+            if _is_duplicate_task(host, task):
+                LOG.debug("'%s' skipped because role has already run", task)
                 continue
 
-            if s.run_state == PlayIterator.ITERATING_SETUP:
-                num_setups += 1
-            elif s.run_state == PlayIterator.ITERATING_TASKS:
-                num_tasks += 1
-            elif s.run_state == PlayIterator.ITERATING_RESCUE:
-                num_rescue += 1
-            elif s.run_state == PlayIterator.ITERATING_ALWAYS:
-                num_always += 1
-        display.debug("done counting tasks in each state of execution:\n\tnum_setups: %s\n\tnum_tasks: %s\n\tnum_rescue: %s\n\tnum_always: %s" % (num_setups,
-                                                                                                                                                  num_tasks,
-                                                                                                                                                  num_rescue,
-                                                                                                                                                  num_always))
+            if task.action == 'meta':
+                results.extend(self._execute_meta(task, host))
+            else:
+                self._start_regular_task(host, task, 0, host_index)
 
-        def _advance_selected_hosts(hosts, cur_block, cur_state):
-            '''
-            This helper returns the task for all hosts in the requested
-            state, otherwise they get a noop dummy task. This also advances
-            the state of the host, since the given states are determined
-            while using peek=True.
-            '''
-            # we return the values in the order they were originally
-            # specified in the given hosts array
-            rvals = []
-            display.debug("starting to advance hosts")
-            for host in hosts:
-                host_state_task = host_tasks.get(host.name)
-                if host_state_task is None:
-                    continue
-                (s, t) = host_state_task
-                if t is None:
-                    continue
-                if s.run_state == cur_state and s.cur_block == cur_block:
-                    new_t = iterator.get_next_task_for_host(host)
-                    rvals.append((host, t))
-                else:
-                    rvals.append((host, noop_task))
-            display.debug("done advancing hosts to next task")
-            return rvals
+            if self._is_run_once_task(task):
+                break
 
-        # if any hosts are in ITERATING_SETUP, return the setup task
-        # while all other hosts get a noop
-        if num_setups:
-            display.debug("advancing hosts in ITERATING_SETUP")
-            return _advance_selected_hosts(hosts, lowest_cur_block, PlayIterator.ITERATING_SETUP)
+            max_passes = max(1, len(self._tqm._workers) // 10)
+            results.extend(self._process_pending_results(max_passes))
+            try:
+                self._includes.parse(task, results, self.get_hosts_left())
+            except ansible_mitogen.includes.Error as e:
+                LOG.error('include processing failed: %s', e)
+                self._run_result = _self._tqm.RUN_ERROR
 
-        # if any hosts are in ITERATING_TASKS, return the next normal
-        # task for these hosts, while all other hosts get a noop
-        if num_tasks:
-            display.debug("advancing hosts in ITERATING_TASKS")
-            return _advance_selected_hosts(hosts, lowest_cur_block, PlayIterator.ITERATING_TASKS)
+        self._drain_results(task, results)
+        return True
 
-        # if any hosts are in ITERATING_RESCUE, return the next rescue
-        # task for these hosts, while all other hosts get a noop
-        if num_rescue:
-            display.debug("advancing hosts in ITERATING_RESCUE")
-            return _advance_selected_hosts(hosts, lowest_cur_block, PlayIterator.ITERATING_RESCUE)
-
-        # if any hosts are in ITERATING_ALWAYS, return the next always
-        # task for these hosts, while all other hosts get a noop
-        if num_always:
-            display.debug("advancing hosts in ITERATING_ALWAYS")
-            return _advance_selected_hosts(hosts, lowest_cur_block, PlayIterator.ITERATING_ALWAYS)
-
-        # at this point, everything must be ITERATING_COMPLETE, so we
-        # return None for all hosts in the list
-        display.debug("all hosts are done, so returning None's for all hosts")
-        return [(host, None) for host in hosts]
+    def _has_no_hosts_remaining(self):
+        return (
+            self._run_result != self._tqm.RUN_OK and
+            len(self._tqm._failed_hosts) >= len(self.get_hosts_left())
+        )
 
     def run(self, iterator, play_context):
-        '''
-        The linear strategy is simple - get the next task and queue
-        it for all hosts, then wait for the queue to drain before
-        moving on to the next task
-        '''
-
-        # iteratate over each task, while there is one left to run
-        result = self._tqm.RUN_OK
-        work_to_do = True
-        while work_to_do and not self._tqm._terminated:
-
+        """
+        See StrategyBase.run().
+        """
+        self.construct(iterator, play_context)
+        while not self._tqm._terminated:
             try:
-                display.debug("getting the remaining hosts for this loop")
-                hosts_left = self.get_hosts_left(iterator)
-                display.debug("done getting the remaining hosts for this loop")
-
-                # queue up this task for each host in the inventory
-                callback_sent = False
-                work_to_do = False
-
-                host_results = []
-                host_tasks = self._get_next_task_lockstep(hosts_left, iterator)
-
-                # skip control
-                skip_rest = False
-                choose_step = True
-
-                # flag set if task is set to any_errors_fatal
-                any_errors_fatal = False
-
-                results = []
-                for (host, task) in host_tasks:
-                    if not task:
-                        continue
-
-                    if self._tqm._terminated:
-                        break
-
-                    run_once = False
-                    work_to_do = True
-
-                    # test to see if the task across all hosts points to an action plugin which
-                    # sets BYPASS_HOST_LOOP to true, or if it has run_once enabled. If so, we
-                    # will only send this task to the first host in the list.
-
-                    try:
-                        action = action_loader.get(task.action, class_only=True)
-                    except KeyError:
-                        # we don't care here, because the action may simply not have a
-                        # corresponding action plugin
-                        action = None
-
-                    # check to see if this task should be skipped, due to it being a member of a
-                    # role which has already run (and whether that role allows duplicate execution)
-                    if task._role and task._role.has_run(host):
-                        # If there is no metadata, the default behavior is to not allow duplicates,
-                        # if there is metadata, check to see if the allow_duplicates flag was set to true
-                        if task._role._metadata is None or task._role._metadata and not task._role._metadata.allow_duplicates:
-                            display.debug("'%s' skipped because role has already run" % task)
-                            continue
-
-                    if task.action == 'meta':
-                        # for the linear strategy, we run meta tasks just once and for
-                        # all hosts currently being iterated over rather than one host
-                        results.extend(self._execute_meta(task, play_context, iterator, host))
-                        if task.args.get('_raw_params', None) != 'noop':
-                            run_once = True
-                    else:
-                        # handle step if needed, skip meta actions as they are used internally
-                        if self._step and choose_step:
-                            if self._take_step(task):
-                                choose_step = False
-                            else:
-                                skip_rest = True
-                                break
-
-                        display.debug("getting variables")
-                        task_vars = self._variable_manager.get_vars(play=iterator._play, host=host, task=task)
-                        self.add_tqm_variables(task_vars, play=iterator._play)
-                        templar = Templar(loader=self._loader, variables=task_vars)
-                        display.debug("done getting variables")
-
-                        run_once = templar.template(task.run_once) or action and getattr(action, 'BYPASS_HOST_LOOP', False)
-
-                        if (task.any_errors_fatal or run_once) and not task.ignore_errors:
-                            any_errors_fatal = True
-
-                        if not callback_sent:
-                            display.debug("sending task start callback, copying the task so we can template it temporarily")
-                            saved_name = task.name
-                            display.debug("done copying, going to template now")
-                            try:
-                                task.name = to_text(templar.template(task.name, fail_on_undefined=False), nonstring='empty')
-                                display.debug("done templating")
-                            except:
-                                # just ignore any errors during task name templating,
-                                # we don't care if it just shows the raw name
-                                display.debug("templating failed for some reason")
-                            display.debug("here goes the callback...")
-                            self._tqm.send_callback('v2_playbook_on_task_start', task, is_conditional=False)
-                            task.name = saved_name
-                            callback_sent = True
-                            display.debug("sending task start callback")
-
-                        self._blocked_hosts[host.get_name()] = True
-                        self._queue_task(host, task, task_vars, play_context)
-                        del task_vars
-
-                    # if we're bypassing the host loop, break out now
-                    if run_once:
-                        break
-
-                    results += self._process_pending_results(iterator, max_passes=max(1, int(len(self._tqm._workers) * 0.1)))
-
-                # go to next host/task group
-                if skip_rest:
-                    continue
-
-                display.debug("done queuing things up, now waiting for results queue to drain")
-                if self._pending_results > 0:
-                    results += self._wait_on_pending_results(iterator)
-
-                host_results.extend(results)
-
-                self.update_active_connections(results)
-
-                try:
-                    included_files = IncludedFile.process_include_results(
-                        host_results,
-                        iterator=iterator,
-                        loader=self._loader,
-                        variable_manager=self._variable_manager
-                    )
-                except AnsibleError as e:
-                    # this is a fatal error, so we abort here regardless of block state
-                    return self._tqm.RUN_ERROR
-
-                include_failure = False
-                if len(included_files) > 0:
-                    display.debug("we have included files to process")
-
-                    display.debug("generating all_blocks data")
-                    all_blocks = dict((host, []) for host in hosts_left)
-                    display.debug("done generating all_blocks data")
-                    for included_file in included_files:
-                        display.debug("processing included file: %s" % included_file._filename)
-                        # included hosts get the task list while those excluded get an equal-length
-                        # list of noop tasks, to make sure that they continue running in lock-step
-                        try:
-                            if included_file._is_role:
-                                new_ir = self._copy_included_file(included_file)
-
-                                new_blocks, handler_blocks = new_ir.get_block_list(
-                                    play=iterator._play,
-                                    variable_manager=self._variable_manager,
-                                    loader=self._loader,
-                                )
-                                self._tqm.update_handler_list([handler for handler_block in handler_blocks for handler in handler_block.block])
-                            else:
-                                new_blocks = self._load_included_file(included_file, iterator=iterator)
-
-                            display.debug("iterating over new_blocks loaded from include file")
-                            for new_block in new_blocks:
-                                task_vars = self._variable_manager.get_vars(
-                                    play=iterator._play,
-                                    task=new_block._parent
-                                )
-                                display.debug("filtering new block on tags")
-                                final_block = new_block.filter_tagged_tasks(play_context, task_vars)
-                                display.debug("done filtering new block on tags")
-
-                                noop_block = self._prepare_and_create_noop_block_from(final_block, task._parent, iterator)
-
-                                for host in hosts_left:
-                                    if host in included_file._hosts:
-                                        all_blocks[host].append(final_block)
-                                    else:
-                                        all_blocks[host].append(noop_block)
-                            display.debug("done iterating over new_blocks loaded from include file")
-
-                        except AnsibleError as e:
-                            for host in included_file._hosts:
-                                self._tqm._failed_hosts[host.name] = True
-                                iterator.mark_host_failed(host)
-                            display.error(to_text(e), wrap_text=False)
-                            include_failure = True
-                            continue
-
-                    # finally go through all of the hosts and append the
-                    # accumulated blocks to their list of tasks
-                    display.debug("extending task lists for all hosts with included blocks")
-
-                    for host in hosts_left:
-                        iterator.add_tasks(host, all_blocks[host])
-
-                    display.debug("done extending task lists")
-                    display.debug("done processing included files")
-
-                display.debug("results queue empty")
-
-                display.debug("checking for any_errors_fatal")
-                failed_hosts = []
-                unreachable_hosts = []
-                for res in results:
-                    if res.is_failed() and iterator.is_failed(res._host):
-                        failed_hosts.append(res._host.name)
-                    elif res.is_unreachable():
-                        unreachable_hosts.append(res._host.name)
-
-                # if any_errors_fatal and we had an error, mark all hosts as failed
-                if any_errors_fatal and (len(failed_hosts) > 0 or len(unreachable_hosts) > 0):
-                    dont_fail_states = frozenset([iterator.ITERATING_RESCUE, iterator.ITERATING_ALWAYS])
-                    for host in hosts_left:
-                        (s, _) = iterator.get_next_task_for_host(host, peek=True)
-                        if s.run_state not in dont_fail_states or \
-                           s.run_state == iterator.ITERATING_RESCUE and s.fail_state & iterator.FAILED_RESCUE != 0:
-                            self._tqm._failed_hosts[host.name] = True
-                            result |= self._tqm.RUN_FAILED_BREAK_PLAY
-                display.debug("done checking for any_errors_fatal")
-
-                display.debug("checking for max_fail_percentage")
-                if iterator._play.max_fail_percentage is not None and len(results) > 0:
-                    percentage = iterator._play.max_fail_percentage / 100.0
-
-                    if (len(self._tqm._failed_hosts) / iterator.batch_size) > percentage:
-                        for host in hosts_left:
-                            # don't double-mark hosts, or the iterator will potentially
-                            # fail them out of the rescue/always states
-                            if host.name not in failed_hosts:
-                                self._tqm._failed_hosts[host.name] = True
-                                iterator.mark_host_failed(host)
-                        self._tqm.send_callback('v2_playbook_on_no_hosts_remaining')
-                        result |= self._tqm.RUN_FAILED_BREAK_PLAY
-                    display.debug('(%s failed / %s total )> %s max fail' % (len(self._tqm._failed_hosts), iterator.batch_size, percentage))
-                display.debug("done checking for max_fail_percentage")
-
-                display.debug("checking to see if all hosts have failed and the running result is not ok")
-                if result != self._tqm.RUN_OK and len(self._tqm._failed_hosts) >= len(hosts_left):
-                    display.debug("^ not ok, so returning result now")
-                    self._tqm.send_callback('v2_playbook_on_no_hosts_remaining')
-                    return result
-                display.debug("done checking to see if all hosts have failed")
-
-            except (IOError, EOFError) as e:
-                display.debug("got IOError/EOFError in task loop: %s" % e)
-                # most likely an abort, return failed
+                if not self._run_next_task():
+                    break
+            except (IOError, EOFError):
+                LOG.error('Most likely an abort, return failed')
                 return self._tqm.RUN_UNKNOWN_ERROR
 
-        # run the base class run() method, which executes the cleanup function
-        # and runs any outstanding handlers which have been triggered
+            if self._has_no_hosts_remaining():
+                self._tqm.send_callback('v2_playbook_on_no_hosts_remaining')
+                break
 
-        return super(StrategyModule, self).run(iterator, play_context, result)
+        return super(StrategyModule, self).run(
+            iterator,
+            play_context,
+            self._run_result,
+        )
