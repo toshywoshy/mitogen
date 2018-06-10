@@ -1,0 +1,158 @@
+<!doctype html>
+
+<style>
+    body {
+        font-family: sans-serif;
+        font-size: 10pt;
+        background: black;
+        color: #bfbfbf;
+    }
+
+    a, a:visited {
+        color: #6f6fff;
+    }
+
+    table {
+        border-collapse: collapse;
+    }
+
+    td, th {
+        border: 1px solid #4f4f4f;
+    }
+</style>
+
+<script id="routersTemplate" type="text/template">
+    <table border="1">
+        <caption>Routers - context ID [[= it.contextId ]]</caption>
+        <thead>
+            <th>ID</th>
+            <th>#Streams</th>
+            <th>#Contexts</th>
+            <th>#Handles</th>
+        </thead>
+        <tbody>
+            [[~Object.values(it.routers) :router:index]]
+            <tr>
+                <td><a class="routerId" href="#"
+                    data-myRouterId="[[= it.routerId ]]"
+                    data-contextId="[[= it.contextId ]]"
+                    data-theirRouterId="[[= router.id ]]"
+                    >[[= router.id]]</a></td>
+                <td>[[= router.streams]]</td>
+                <td>[[= router.contexts]]</td>
+                <td>[[= router.handles]]</td>
+            [[~]]
+        </tbody>
+    </table>
+</script>
+
+<script id="streamsTemplate" type="text/template">
+    <table border="1">
+        <caption>Streams - context ID [[= it.contextId ]]</caption>
+        <thead>
+            <th>ID</th>
+            <th>Name</th>
+            <th>Remote ID</th>
+            <th>#Routes</th>
+            <th>#Modules</th>
+            <th>Type</th>
+        </thead>
+        <tbody>
+            [[~Object.values(it.routers) :router:index]]
+            <tr>
+                <td><a class="routerId" href="#"
+                    data-myRouterId="[[= it.routerId ]]"
+                    data-contextId="[[= it.contextId ]]"
+                    data-theirRouterId="[[= router.id ]]"
+                    >[[= router.id]]</a></td>
+                <td>[[= router.streams]]</td>
+                <td>[[= router.contexts]]</td>
+                <td>[[= stream.handles]]</td>
+            [[~]]
+        </tbody>
+    </table>
+</script>
+
+<body>
+</body>
+
+
+<script src="/static/jquery-3.3.1.min.js"></script>
+<script src="/static/sprintf.min.js"></script>
+<script src="/static/doT.min.js"></script>
+<script>
+    var APP_DATA = {
+        contextId: {{context_id}}
+    };
+
+    function render(id, args)
+    {
+        var fn = doT.template($('#' + id).text());
+        return fn(args);
+    }
+
+    doT.templateSettings = {
+        evaluate:    /\[\[([\s\S]+?)\]\]/g,
+        interpolate: /\[\[=([\s\S]+?)\]\]/g,
+        encode:      /\[\[!([\s\S]+?)\]\]/g,
+        use:         /\[\[#([\s\S]+?)\]\]/g,
+        define:      /\[\[##\s*([\w\.$]+)\s*(\:|=)([\s\S]+?)#\]\]/g,
+        conditional: /\[\[\?(\?)?\s*([\s\S]*?)\s*\]\]/g,
+        iterate:     /\[\[~\s*(?:\]\]|([\s\S]+?)\s*\:\s*([\w$]+)\s*(?:\:\s*([\w$]+))?\s*\]\])/g,
+        varname: 'it',
+        strip: true,
+        append: true,
+        selfcontained: false
+    };
+
+
+    function getRouterList(contextId)
+    {
+        $.ajax({
+            url: sprintf('/api/contexts/%s/routers/', contextId),
+            success: onGetRouterListDone
+        });
+    }
+
+    function onGetRouterListDone(response)
+    {
+        var rendered = render('routersTemplate', {
+            contextId: APP_DATA.contextId,
+            routers: response.routers
+        });
+        $(rendered).appendTo('body');
+
+        var ids = Object.keys(response.routers);
+        if(ids.length) {
+            getStreamList(APP_DATA.contextId, ids[0]);
+        }
+    }
+
+
+    function getStreamList(contextId, routerId)
+    {
+        $.get('/api/contexts/' + contextId + '/routers/' + routerId + '/streams/',
+            function(response) {
+                alert(response.toSource());
+            }
+        );
+    }
+
+
+    function onRouterIdClick(event)
+    {
+        event.preventDefault();
+        var target = $(event.target);
+        var routerId = $(event.target).attr('href');
+        getStreamList(routerId);
+    }
+
+
+    $(function()
+    {
+        getRouterList(APP_DATA.contextId);
+        $(document).on('click', 'a.routerId', onRouterIdClick);
+    });
+
+
+</script>
