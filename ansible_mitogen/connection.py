@@ -36,6 +36,7 @@ import stat
 import time
 
 import jinja2.runtime
+from ansible.module_utils import six
 import ansible.constants as C
 import ansible.errors
 import ansible.plugins.connection
@@ -48,6 +49,23 @@ import ansible_mitogen.parsing
 import ansible_mitogen.process
 import ansible_mitogen.services
 import ansible_mitogen.target
+
+
+def hash_obj(obj):
+    """
+    Generate a deduplication key from the request.
+    """
+    h = 0
+    stack = [obj]
+    while stack:
+        obj = stack.pop()
+        if isinstance(obj, dict):
+            stack.extend(sorted(obj.items()))
+        elif isinstance(obj, (list, tuple)):
+            stack.extend(obj)
+        else:
+            h += hash(obj)
+    return h
 
 
 LOG = logging.getLogger(__name__)
@@ -341,6 +359,9 @@ class Connection(ansible.plugins.connection.ConnectionBase):
     #: mitogen.master.Broker for this worker.
     broker = None
 
+    #: Name of multiplexer process socket we are currently connected to.
+    listener_path = None
+
     #: mitogen.master.Router for this worker.
     router = None
 
@@ -400,7 +421,7 @@ class Connection(ansible.plugins.connection.ConnectionBase):
     home_dir = None
 
     def __init__(self, play_context, new_stdin, **kwargs):
-        assert ansible_mitogen.process.MuxProcess.unix_listener_path, (
+        assert ansible_mitogen.process.MuxProcess.cls_listener_paths, (
             'Mitogen connection types may only be instantiated '
             'while the "mitogen" strategy is active.'
         )
@@ -492,6 +513,21 @@ class Connection(ansible.plugins.connection.ConnectionBase):
 
         return stack, seen_names
 
+    def _listener_for_stack(self, stack):
+        """
+        Given a connection stack, return the UNIX listener path that should be
+        used to communicate with it. This is a simple hash of the configuration
+        of the first hop.
+        """
+        h = hash_obj(stack[0])
+        if len(stack) > 1 and stack[0]['method'] == 'local':
+            h += hash_obj(stack[1])
+
+        paths = ansible_mitogen.process.MuxProcess.cls_listener_paths
+        idx = abs(h) % len(paths)
+        LOG.debug('Picked listener %d: %s', idx, paths[idx])
+        return paths[idx]
+
     def _connect(self):
         """
         Establish a connection to the master process's UNIX listener socket,
@@ -506,13 +542,6 @@ class Connection(ansible.plugins.connection.ConnectionBase):
         if self.connected:
             return
 
-        if not self.broker:
-            self.broker = mitogen.master.Broker()
-            self.router, self.parent = mitogen.unix.connect(
-                path=ansible_mitogen.process.MuxProcess.unix_listener_path,
-                broker=self.broker,
-            )
-
         stack, _ = self._stack_from_config(
             config_from_play_context(
                 transport=self.transport,
@@ -520,6 +549,23 @@ class Connection(ansible.plugins.connection.ConnectionBase):
                 connection=self
             )
         )
+        listener_path = self._listener_for_stack(stack)
+
+        if not self.broker:
+            self.broker = mitogen.master.Broker()
+
+        if self.listener_path != listener_path:
+            if self.parent:
+                # Router can just be overwritten, but the previous parent
+                # connection must explicitly be removed from the broker first.
+                self.router.disconnect(self.parent)
+                self.parent = None
+
+            self.router, self.parent = mitogen.unix.connect(
+                path=listener_path,
+                broker=self.broker,
+            )
+            self.listener_path = listener_path
 
         dct = self.parent.call_service(
             service_name='ansible_mitogen.services.ContextService',

@@ -29,6 +29,7 @@
 from __future__ import absolute_import
 import errno
 import logging
+import multiprocessing
 import os
 import signal
 import socket
@@ -74,59 +75,25 @@ class MuxProcess(object):
     #: which the MuxProcess blocks reading from in order to determine when
     #: the master process dies. Once the read returns, the MuxProcess will
     #: begin shutting itself down.
-    worker_sock = None
+    cls_worker_sock = None
 
     #: In the worker process, this references the other end of
-    #: :py:attr:`worker_sock`.
-    child_sock = None
-
-    #: In the top-level process, this is the PID of the single MuxProcess
-    #: that was spawned.
-    worker_pid = None
+    #: :py:attr:`cls_worker_sock`.
+    cls_child_sock = None
 
     #: A copy of :data:`os.environ` at the time the multiplexer process was
     #: started. It's used by mitogen_local.py to find changes made to the
     #: top-level environment (e.g. vars plugins -- issue #297) that must be
     #: applied to locally executed commands and modules.
-    original_env = None
+    cls_original_env = None
 
-    #: In both processes, this is the temporary UNIX socket used for
-    #: forked WorkerProcesses to contact the MuxProcess
-    unix_listener_path = None
+    #: In both processes, this a listof the temporary UNIX sockets used for
+    #: forked WorkerProcesses to contact the forked mux processes.
+    cls_listener_paths = None
 
-    #: Singleton.
-    _instance = None
-
-    @classmethod
-    def start(cls):
-        """
-        Arrange for the subprocess to be started, if it is not already running.
-
-        The parent process picks a UNIX socket path the child will use prior to
-        fork, creates a socketpair used essentially as a semaphore, then blocks
-        waiting for the child to indicate the UNIX socket is ready for use.
-        """
-        if cls.worker_sock is not None:
-            return
-
-        cls.unix_listener_path = mitogen.unix.make_socket_path()
-        cls.worker_sock, cls.child_sock = socket.socketpair()
-        mitogen.core.set_cloexec(cls.worker_sock.fileno())
-        mitogen.core.set_cloexec(cls.child_sock.fileno())
-
-        cls.original_env = dict(os.environ)
-        cls.child_pid = os.fork()
-        ansible_mitogen.logging.setup()
-        if cls.child_pid:
-            cls.child_sock.close()
-            cls.child_sock = None
-            mitogen.core.io_op(cls.worker_sock.recv, 1)
-        else:
-            cls.worker_sock.close()
-            cls.worker_sock = None
-            self = cls()
-            self.worker_main()
-            sys.exit()
+    def __init__(self, path):
+        #: Individual path of this process.
+        self.listener_path = path
 
     def worker_main(self):
         """
@@ -138,10 +105,10 @@ class MuxProcess(object):
         self._setup_services()
 
         # Let the parent know our listening socket is ready.
-        mitogen.core.io_op(self.child_sock.send, b('1'))
-        self.child_sock.send(b('1'))
+        mitogen.core.io_op(self.cls_child_sock.send, b('1'))
+        self.cls_child_sock.send(b('1'))
         # Block until the socket is closed, which happens on parent exit.
-        mitogen.core.io_op(self.child_sock.recv, 1)
+        mitogen.core.io_op(self.cls_child_sock.recv, 1)
 
     def _setup_master(self):
         """
@@ -154,7 +121,7 @@ class MuxProcess(object):
         mitogen.core.listen(self.router.broker, 'exit', self.on_broker_exit)
         self.listener = mitogen.unix.Listener(
             router=self.router,
-            path=self.unix_listener_path,
+            path=self.listener_path,
         )
         if 'MITOGEN_ROUTER_DEBUG' in os.environ:
             self.router.enable_debug()
@@ -200,3 +167,51 @@ class MuxProcess(object):
         fine for now.
         """
         os.kill(os.getpid(), signal.SIGTERM)
+
+
+def _start_child(path):
+    pid = os.fork()
+    if pid:
+        # Wait for child to boot before continuing.
+        mitogen.core.io_op(MuxProcess.cls_worker_sock.recv, 1)
+        return
+
+    MuxProcess.cls_worker_sock.close()
+    MuxProcess.cls_worker_sock = None
+    proc = MuxProcess(path)
+    try:
+        proc.worker_main()
+    finally:
+        sys.exit()
+
+
+def start():
+    """
+    Arrange for the subprocess to be started, if it is not already running.
+
+    The parent process picks a UNIX socket path the child will use prior to
+    fork, creates a socketpair used essentially as a semaphore, then blocks
+    waiting for the child to indicate the UNIX socket is ready for use.
+    """
+    if MuxProcess.cls_listener_paths is not None:
+        return
+
+    MuxProcess.cls_original_env = dict(os.environ)
+    ansible_mitogen.logging.setup()
+
+    MuxProcess.cls_listener_paths = [
+        mitogen.unix.make_socket_path()
+        for _ in range(multiprocessing.cpu_count())
+    ]
+
+    MuxProcess.cls_worker_sock, \
+    MuxProcess.cls_child_sock = socket.socketpair()
+
+    mitogen.core.set_cloexec(MuxProcess.cls_worker_sock.fileno())
+    mitogen.core.set_cloexec(MuxProcess.cls_child_sock.fileno())
+
+    for path in MuxProcess.cls_listener_paths:
+        _start_child(path)
+
+    MuxProcess.cls_child_sock.close()
+    MuxProcess.cls_child_sock = None

@@ -161,7 +161,7 @@ class StrategyMixin(object):
         Arrange for a mitogen.master.Router to be available for the duration of
         the strategy's real run() method.
         """
-        ansible_mitogen.process.MuxProcess.start()
+        ansible_mitogen.process.start()
         self._add_connection_plugin_path()
         self._install_wrappers()
         try:
