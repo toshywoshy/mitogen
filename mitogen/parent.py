@@ -1185,6 +1185,23 @@ class Router(mitogen.core.Router):
         stream.detached = True
         msg.reply(None)
 
+    def disconnect(self, context):
+        """
+        Disconnect a context and forget its stream, assuming the context is
+        directly connected.
+        """
+        stream = self.stream_by_id(context)
+        if stream.remote_id != context.context_id:
+            return
+
+        l = mitogen.core.Latch()
+        mitogen.core.listen(stream, 'disconnect', l.put)
+        def disconnect():
+            LOG.debug('Starting disconnect of %r', stream)
+            stream.on_disconnect(self.broker)
+        self.broker.defer(disconnect)
+        l.get()
+
     def add_route(self, target_id, stream):
         LOG.debug('%r.add_route(%r, %r)', self, target_id, stream)
         assert isinstance(target_id, int)

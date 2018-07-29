@@ -1390,7 +1390,7 @@ class Latch(object):
         finally:
             self._lock.release()
 
-    def put(self, obj):
+    def put(self, obj=None):
         """
         Enqueue an object, waking the first thread waiting for a result, if one
         exists.
